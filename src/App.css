@@ -1,84 +1,317 @@
-* {
-  box-sizing: border-box;
+import { useRef, useState } from "react";
+import "./App.css";
+
+function App() {
+  const [recording, setRecording] = useState(false);
+  const [partialText, setPartialText] = useState("");
+  const [finalText, setFinalText] = useState("");
+  const [error, setError] = useState("");
+
+  const socketRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const sourceRef = useRef(null);
+  const processorRef = useRef(null);
+  const streamRef = useRef(null);
+
+  const startRecording = async () => {
+    try {
+      setError("");
+      setPartialText("");
+      setFinalText("");
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+
+      streamRef.current = stream;
+
+      const socket = new WebSocket(
+        "ws://127.0.0.1:5000/transcribe"
+      );
+
+      socket.binaryType = "arraybuffer";
+
+      socket.onopen = () => {
+        console.log("WebSocket connected");
+
+        setupAudio(stream, socket);
+
+        setRecording(true);
+      };
+
+      socket.onmessage = (event) => {
+        const data = JSON.parse(event.data);
+
+        if (data.type === "partial") {
+          setPartialText(data.text);
+        }
+
+        if (data.type === "final") {
+          if (data.text) {
+            setFinalText((previous) => {
+              const combined = previous
+                ? `${previous} ${data.text}`
+                : data.text;
+
+              return combined.trim();
+            });
+          }
+
+          setPartialText("");
+        }
+
+        if (data.type === "error") {
+          setError(data.message);
+        }
+      };
+
+      socket.onerror = () => {
+        setError("Could not connect to the Flask server.");
+      };
+
+      socket.onclose = () => {
+        console.log("WebSocket closed");
+      };
+
+      socketRef.current = socket;
+    } catch (err) {
+      console.error(err);
+
+      setError(
+        "Microphone access failed. Please allow microphone permission."
+      );
+    }
+  };
+
+  const setupAudio = (stream, socket) => {
+    /*
+     * Firefox normally gives us 48000 Hz audio.
+     *
+     * Vosk is configured for 16000 Hz.
+     *
+     * So we explicitly convert:
+     *
+     * 48000 Hz -> 16000 Hz
+     *
+     * before sending audio to Flask.
+     */
+
+    const audioContext = new AudioContext();
+
+    audioContextRef.current = audioContext;
+
+    console.log(
+      "Browser sample rate:",
+      audioContext.sampleRate
+    );
+
+    const source =
+      audioContext.createMediaStreamSource(stream);
+
+    sourceRef.current = source;
+
+    const processor =
+      audioContext.createScriptProcessor(
+        4096,
+        1,
+        1
+      );
+
+    processorRef.current = processor;
+
+    processor.onaudioprocess = (event) => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        return;
+      }
+
+      const input =
+        event.inputBuffer.getChannelData(0);
+
+      /*
+       * Convert browser sample rate to 16000 Hz.
+       */
+
+      const inputSampleRate =
+        audioContext.sampleRate;
+
+      const outputSampleRate = 16000;
+
+      const ratio =
+        inputSampleRate / outputSampleRate;
+
+      const outputLength =
+        Math.floor(input.length / ratio);
+
+      const pcm = new Int16Array(outputLength);
+
+      for (let i = 0; i < outputLength; i++) {
+        const position = i * ratio;
+
+        const index = Math.floor(position);
+
+        const nextIndex =
+          Math.min(index + 1, input.length - 1);
+
+        const fraction = position - index;
+
+        /*
+         * Linear interpolation.
+         * This gives us much cleaner downsampling
+         * than simply throwing samples away.
+         */
+
+        const sample =
+          input[index] * (1 - fraction) +
+          input[nextIndex] * fraction;
+
+        const clamped =
+          Math.max(-1, Math.min(1, sample));
+
+        pcm[i] =
+          clamped < 0
+            ? clamped * 0x8000
+            : clamped * 0x7fff;
+      }
+
+      /*
+       * Send actual 16 kHz PCM audio to Vosk.
+       */
+
+      socket.send(pcm.buffer);
+    };
+
+    source.connect(processor);
+
+    /*
+     * Connecting to destination keeps the ScriptProcessor
+     * active in Firefox.
+     *
+     * We don't want audible microphone feedback, so
+     * create a silent gain node.
+     */
+
+    const silentGain =
+      audioContext.createGain();
+
+    silentGain.gain.value = 0;
+
+    processor.connect(silentGain);
+
+    silentGain.connect(
+      audioContext.destination
+    );
+  };
+
+  const stopRecording = () => {
+    setRecording(false);
+
+    if (
+      socketRef.current &&
+      socketRef.current.readyState ===
+        WebSocket.OPEN
+    ) {
+      socketRef.current.send(
+        JSON.stringify({
+          type: "stop",
+        })
+      );
+    }
+
+    if (streamRef.current) {
+      streamRef.current
+        .getTracks()
+        .forEach((track) => {
+          track.stop();
+        });
+
+      streamRef.current = null;
+    }
+
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+
+    if (sourceRef.current) {
+      sourceRef.current.disconnect();
+      sourceRef.current = null;
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+
+    setTimeout(() => {
+      if (socketRef.current) {
+        socketRef.current.close();
+        socketRef.current = null;
+      }
+    }, 500);
+  };
+
+  return (
+    <div className="app">
+      <h1>SIH Voice Assessment</h1>
+
+      <p className="description">
+        Speak into the microphone. Your speech will
+        appear in real time.
+      </p>
+
+      <button
+        className={
+          recording
+            ? "mic-button recording"
+            : "mic-button"
+        }
+        onClick={
+          recording
+            ? stopRecording
+            : startRecording
+        }
+      >
+        {recording ? "⏹" : "🎤"}
+      </button>
+
+      <p className="status">
+        {recording
+          ? "Listening..."
+          : "Click the microphone to start"}
+      </p>
+
+      {error && (
+        <div className="error">
+          {error}
+        </div>
+      )}
+
+      <div className="transcript-box">
+        <h2>Transcript</h2>
+
+        <p className="final-text">
+          {finalText}
+        </p>
+
+        {recording && partialText && (
+          <p className="partial-text">
+            {partialText}
+          </p>
+        )}
+
+        {!finalText && !partialText && (
+          <p className="placeholder">
+            Start speaking...
+          </p>
+        )}
+      </div>
+    </div>
+  );
 }
 
-body {
-  margin: 0;
-  font-family: Arial, sans-serif;
-  background: #f5f5f5;
-}
-
-.app {
-  width: 90%;
-  max-width: 700px;
-  margin: 80px auto;
-  text-align: center;
-}
-
-h1 {
-  font-size: 36px;
-  margin-bottom: 10px;
-}
-
-.description {
-  color: #666;
-  margin-bottom: 40px;
-}
-
-.mic-button {
-  width: 110px;
-  height: 110px;
-  border-radius: 50%;
-  border: none;
-  background: #222;
-  color: white;
-  font-size: 42px;
-  cursor: pointer;
-  transition: 0.2s;
-}
-
-.mic-button:hover {
-  transform: scale(1.05);
-}
-
-.mic-button.recording {
-  background: #d22;
-  animation: pulse 1.2s infinite;
-}
-
-.status {
-  margin: 25px 0;
-  font-size: 18px;
-}
-
-textarea {
-  width: 100%;
-  min-height: 180px;
-  padding: 15px;
-  border: 1px solid #ccc;
-  border-radius: 10px;
-  font-size: 18px;
-  resize: vertical;
-}
-
-.error {
-  background: #ffe5e5;
-  color: #b00000;
-  padding: 12px;
-  border-radius: 8px;
-  margin: 20px 0;
-}
-
-@keyframes pulse {
-  0% {
-    transform: scale(1);
-  }
-
-  50% {
-    transform: scale(1.08);
-  }
-
-  100% {
-    transform: scale(1);
-  }
-}
+export default App;

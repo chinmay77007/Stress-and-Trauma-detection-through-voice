@@ -1,72 +1,167 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import whisper
+import json
 import os
-import tempfile
+import spacy
+
+from flask import Flask, jsonify
+from flask_cors import CORS
+from flask_sock import Sock
+from vosk import Model, KaldiRecognizer
+
 
 app = Flask(__name__)
 CORS(app)
 
-print("Loading Whisper model...")
-model = whisper.load_model("base")
-print("Whisper model loaded!")
+sock = Sock(app)
 
 
-@app.route("/transcribe", methods=["POST"])
-def transcribe():
+MODEL_PATH = "vosk-model-hi-0.22"
+#MODEL_PATH = "vosk-model-en-in-0.5"
+print("Loading Vosk model...")
 
-    if "audio" not in request.files:
-        return jsonify({
-            "error": "No audio file received"
-        }), 400
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(
+        f"Vosk model not found: {MODEL_PATH}"
+    )
 
-    audio = request.files["audio"]
+model = Model(MODEL_PATH)
 
-    # Create temporary audio file
-    with tempfile.NamedTemporaryFile(
-        delete=False,
-        suffix=".webm"
-    ) as temp:
+print("Vosk model loaded!")
 
-        audio.save(temp.name)
-        temp_path = temp.name
+print("Loading spaCy model...")
 
-    try:
+nlp = spacy.load("en_core_web_sm")
 
-        # Transcribe audio
-        result = model.transcribe(
-            temp_path,
-            language="en"
-        )
-
-        transcript = result["text"].strip()
-
-        return jsonify({
-            "success": True,
-            "text": transcript
-        })
-
-    except Exception as e:
-
-        return jsonify({
-            "success": False,
-            "error": str(e)
-        }), 500
-
-    finally:
-
-        if os.path.exists(temp_path):
-            os.remove(temp_path)
-
-
+print("spaCy model loaded!")
 @app.route("/")
 def home():
     return jsonify({
-        "message": "SIH Speech Recognition API is running"
+        "status": "running",
+        "message": "SIH Speech Recognition API"
     })
+
+def process_text(text):
+
+    doc = nlp(text)
+
+    tokens = []
+    lemmas = []
+
+    for token in doc:
+
+        if not token.is_stop and not token.is_punct:
+
+            tokens.append(token.text)
+            lemmas.append(token.lemma_)
+
+    return {
+        "tokens": tokens,
+        "lemmas": lemmas,
+        "sentence_count": len(list(doc.sents))
+    }
+
+@sock.route("/transcribe")
+def transcribe(ws):
+
+    print("Client connected")
+
+    # Browser audio will be converted to
+    # 16-bit mono PCM at 16000 Hz.
+    recognizer = KaldiRecognizer(
+        model,
+        16000
+    )
+
+    recognizer.SetWords(True)
+    recognizer.SetPartialWords(True)
+
+    try:
+
+        while True:
+
+            data = ws.receive()
+
+            # Client closed connection
+            if data is None:
+                break
+
+            # JSON messages are used for control
+            if isinstance(data, str):
+
+                message = json.loads(data)
+
+                if message.get("type") == "stop":
+
+                    final_result = json.loads(
+                        recognizer.FinalResult()
+                    )
+
+                    ws.send(json.dumps({
+                        "type": "final",
+                        "text": final_result.get(
+                            "text",
+                            ""
+                        )
+                    }))
+
+                    break
+
+                continue
+
+            # Audio data
+            if recognizer.AcceptWaveform(data):
+
+               result = json.loads(
+                  recognizer.Result()
+               )
+
+               text = result.get("text", "")
+
+               nlp_result = process_text(text)
+
+               ws.send(json.dumps({
+               "type": "final",
+               "text": text,
+               "nlp": nlp_result
+            }))
+
+            else:
+
+                partial = json.loads(
+                    recognizer.PartialResult()
+                )
+
+                ws.send(json.dumps({
+                    "type": "partial",
+                    "text": partial.get(
+                        "partial",
+                        ""
+                    )
+                }))
+
+    except Exception as e:
+
+        print("WebSocket error:", e)
+
+        try:
+            ws.send(json.dumps({
+                "type": "error",
+                "message": str(e)
+            }))
+        except Exception:
+            pass
+
+    finally:
+
+        print("Client disconnected")
 
 
 if __name__ == "__main__":
+
+    print(
+        "Starting server on "
+        "http://127.0.0.1:5000"
+    )
+
     app.run(
         host="0.0.0.0",
         port=5000,
