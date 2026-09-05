@@ -1,0 +1,14 @@
+Flask==3.0.3
+flask-cors==4.0.1
+flask-sock==0.7.0
+vosk==0.3.45
+spacy==3.7.5
+numpy==1.26.4
+librosa==0.10.2
+transformers==4.44.2
+torch==2.4.0
+faster-whisper==1.0.3
+
+# spaCy's English model isn't installed via pip like a normal package --
+# run this once after `pip install -r requirements.txt`:
+#   python -m spacy download en_core_web_sm

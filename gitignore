@@ -1,0 +1,37 @@
+# --- Vosk models (large binary folders, don't belong in git) ---
+vosk-model-*/
+*.zip
+
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- Cached/downloaded ML model weights ---
+# transformers/faster-whisper/torch download their weights into local
+# caches on first run -- these can be several hundred MB and shouldn't
+# be committed. Adjust paths if you've set HF_HOME/XDG_CACHE_HOME elsewhere.
+.cache/
+**/huggingface/
+**/torch/
+
+# --- Node / React frontend ---
+node_modules/
+dist/
+build/
+.vite/
+
+# --- Env / secrets ---
+.env
+.env.local
+
+# --- OS / editor cruft ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
