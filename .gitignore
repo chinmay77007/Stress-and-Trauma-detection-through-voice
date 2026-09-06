@@ -22,3 +22,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+backend/vosk-model-en-in-0.5/
+backend/vosk-model-hi-0.22/
+backend/sessions.db
+backend/recordings/

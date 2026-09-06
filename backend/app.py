@@ -11,13 +11,16 @@ from analysis.text_features import extract_text_features
 from analysis.voice_features import analyze_voice
 from analysis.svi_fusion import compute_svi
 from analysis.stt_refine import refine_transcript
+import db
 
 app = Flask(__name__)
 CORS(app)
 
 sock = Sock(app)
 
-MODEL_PATH = "vosk-model-en-in-0.5"
+db.init_db()
+
+MODEL_PATH = "vosk-model-hi-0.22"  # Hindi Vosk model
 print("Loading Vosk model...")
 
 if not os.path.exists(MODEL_PATH):
@@ -43,6 +46,10 @@ def home():
 def transcribe(ws):
     print("Client connected")
 
+    session_id = db.new_session_id()
+    db.create_session(session_id)
+    print(f"Session started: {session_id}")
+
     recognizer = KaldiRecognizer(model, 16000)
     recognizer.SetWords(True)
     recognizer.SetPartialWords(True)
@@ -50,11 +57,17 @@ def transcribe(ws):
     # Per-utterance audio buffer (reset after each final)
     utterance_audio = bytearray()
 
+    # Full-session audio buffer -- accumulates EVERY utterance's audio for
+    # the whole call, never reset, so the complete recording can be saved
+    # when the session ends.
+    full_session_audio = bytearray()
+
     # Session-level state -- accumulated across the WHOLE call, so scoring
     # reflects the full conversation instead of just the last utterance.
     session_transcript_parts = []
     session_voice_scores = []
     peak_svi = {"svi_score": 0.0, "risk_category": "Low"}
+    utterance_index = 0
 
     try:
         while True:
@@ -77,14 +90,20 @@ def transcribe(ws):
                         session_transcript_parts,
                         session_voice_scores,
                         peak_svi,
+                        session_id,
+                        utterance_index,
                     )
                     ws.send(json.dumps(result_payload))
+
+                    db.finalize_session(session_id, full_session_audio, peak_svi)
+                    print(f"Session ended: {session_id}")
                     break
 
                 continue
 
             # --- Audio data ---
             utterance_audio.extend(data)
+            full_session_audio.extend(data)
 
             if recognizer.AcceptWaveform(data):
                 result = json.loads(recognizer.Result())
@@ -97,10 +116,13 @@ def transcribe(ws):
                         session_transcript_parts,
                         session_voice_scores,
                         peak_svi,
+                        session_id,
+                        utterance_index,
                     )
                     ws.send(json.dumps(result_payload))
+                    utterance_index += 1
 
-                # Reset the audio buffer -- this utterance is done
+                # Reset the per-utterance audio buffer -- this utterance is done
                 utterance_audio = bytearray()
 
             else:
@@ -126,6 +148,12 @@ def transcribe(ws):
         except Exception:
             pass
 
+        # Best-effort save even if the connection dropped mid-call
+        try:
+            db.finalize_session(session_id, full_session_audio, peak_svi)
+        except Exception as db_error:
+            print(f"Failed to finalize session after error: {db_error}")
+
     finally:
         print("Client disconnected")
 
@@ -136,6 +164,8 @@ def _build_final_payload(
     session_transcript_parts,
     session_voice_scores,
     peak_svi,
+    session_id,
+    utterance_index,
 ):
     """
     Run Whisper refinement + per-utterance features for THIS utterance
@@ -144,7 +174,8 @@ def _build_final_payload(
     session-wide SVI, which is what should actually be treated as the
     caller's current risk reading -- scoring each short utterance in
     isolation badly underrepresents distress that only shows up once
-    enough context has accumulated.
+    enough context has accumulated. Also persists this utterance's audio
+    and scores to the database.
     """
     refined_text = vosk_text
 
@@ -199,6 +230,20 @@ def _build_final_payload(
         peak_svi.clear()
         peak_svi.update(session_svi)
 
+    # --- Persist this utterance (audio + scores) ---
+    audio_path = None
+    try:
+        audio_path = db.save_utterance(
+            session_id=session_id,
+            text=refined_text,
+            svi_score=session_svi["svi_score"],
+            risk_category=session_svi["risk_category"],
+            pcm_bytes=bytes(utterance_audio_bytes) if utterance_audio_bytes else None,
+            utterance_index=utterance_index,
+        )
+    except Exception as e:
+        print(f"Failed to save utterance to DB: {e}")
+
     return {
         "type": "final",
         "text": refined_text,
@@ -207,6 +252,7 @@ def _build_final_payload(
         "voice": voice_result,                    # this utterance only (debug)
         "svi": session_svi,                       # cumulative session SVI -- treat this as the current reading
         "peak_svi": dict(peak_svi),               # worst point reached so far this call
+        "audio_path": audio_path,                 # where this utterance's audio was saved
     }
 
 
